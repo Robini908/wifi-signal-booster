@@ -1,0 +1,11 @@
+psutil>=5.9.0
+speedtest-cli>=2.1.3
+scapy>=2.4.5
+# netifaces is optional and requires C++ build tools
+# To install with netifaces: pip install signal-booster[full]
+numpy>=1.24.0
+netaddr>=0.8.0
+click>=8.1.3
+colorama>=0.4.6
+rich>=12.6.0
+pywin32>=305; sys_platform == 'win32' 

@@ -1,0 +1,39 @@
+# Cursor ignore file
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Local development settings
+.env
+.env.local
+
+# Editor specific files
+.vscode/
+.idea/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Log files
+*.log
+
+# Generated visualization files
+signal_booster_metrics.png
+
+# OS specific files
+.DS_Store
+Thumbs.db 

@@ -1,0 +1,1042 @@
+"""
+Linux-specific network utilities for Signal Booster.
+Handles Linux-specific network operations and optimizations.
+"""
+
+import os
+import re
+import subprocess
+import logging
+import tempfile
+import time
+from typing import List, Dict, Optional, Tuple, Any
+
+logger = logging.getLogger(__name__)
+
+def is_root() -> bool:
+    """
+    Check if the current process has root privileges.
+    
+    Returns:
+        Boolean indicating if the process has root privileges
+    """
+    return os.geteuid() == 0
+
+def set_linux_dns(dns_servers: List[str], interface: Optional[str] = None) -> bool:
+    """
+    Set DNS servers on Linux by modifying resolv.conf.
+    
+    Args:
+        dns_servers: List of DNS server IP addresses
+        interface: Network interface to set DNS servers for (optional)
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not is_root():
+        logger.error("Root privileges required to set DNS servers")
+        return False
+    
+    try:
+        # For Network Manager systems
+        if os.path.exists('/etc/NetworkManager/NetworkManager.conf'):
+            # Try to use nmcli first (NetworkManager)
+            if interface:
+                # Get the connection name for the interface
+                result = subprocess.run(
+                    ['nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show', '--active'],
+                    capture_output=True, text=True
+                )
+                
+                if result.returncode != 0:
+                    logger.error(f"Failed to get connection name: {result.stderr}")
+                    return False
+                
+                # Find the connection name for the specified interface
+                connection_name = None
+                for line in result.stdout.splitlines():
+                    if ':' in line:
+                        name, dev = line.split(':')
+                        if dev == interface:
+                            connection_name = name
+                            break
+                
+                if not connection_name:
+                    logger.error(f"Could not find connection name for interface {interface}")
+                    return False
+                
+                # Set DNS servers using nmcli
+                dns_string = ','.join(dns_servers)
+                result = subprocess.run(
+                    ['nmcli', 'connection', 'modify', connection_name, 'ipv4.dns', dns_string],
+                    capture_output=True, text=True
+                )
+                
+                if result.returncode != 0:
+                    logger.error(f"Failed to set DNS servers with nmcli: {result.stderr}")
+                    return False
+                
+                # Restart the connection to apply changes
+                result = subprocess.run(
+                    ['nmcli', 'connection', 'down', connection_name],
+                    capture_output=True, text=True
+                )
+                result = subprocess.run(
+                    ['nmcli', 'connection', 'up', connection_name],
+                    capture_output=True, text=True
+                )
+                
+                logger.info(f"Successfully set DNS servers to {dns_string} using NetworkManager")
+                return True
+        
+        # Fallback to modifying resolv.conf directly
+        # Check if systemd-resolved is in use
+        use_systemd_resolved = os.path.exists('/run/systemd/resolve/resolv.conf')
+        
+        if use_systemd_resolved:
+            logger.info("System uses systemd-resolved, configuring DNS servers")
+            
+            # Create a temporary file to store the new configuration
+            dns_config = []
+            for dns in dns_servers:
+                dns_config.append(f"DNS={dns}")
+            
+            # Write DNS configuration to /etc/systemd/resolved.conf.d/signal-booster.conf
+            os.makedirs('/etc/systemd/resolved.conf.d', exist_ok=True)
+            config_path = '/etc/systemd/resolved.conf.d/signal-booster.conf'
+            
+            with open(config_path, 'w') as f:
+                f.write("[Resolve]\n")
+                f.write("\n".join(dns_config))
+            
+            # Restart systemd-resolved
+            result = subprocess.run(
+                ['systemctl', 'restart', 'systemd-resolved'],
+                capture_output=True, text=True
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"Failed to restart systemd-resolved: {result.stderr}")
+                return False
+            
+            logger.info(f"Successfully set DNS servers to {dns_servers} using systemd-resolved")
+            return True
+        else:
+            # Traditional resolv.conf approach
+            with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+                temp_file.write("# Generated by Signal Booster\n")
+                
+                # Check if there's a search domain to preserve
+                search_domain = None
+                if os.path.exists('/etc/resolv.conf'):
+                    with open('/etc/resolv.conf', 'r') as old_file:
+                        for line in old_file:
+                            if line.startswith('search') or line.startswith('domain'):
+                                search_domain = line.strip()
+                                break
+                
+                if search_domain:
+                    temp_file.write(f"{search_domain}\n")
+                
+                # Add the nameservers
+                for dns in dns_servers:
+                    temp_file.write(f"nameserver {dns}\n")
+            
+            # Replace the resolv.conf with the new file
+            os.replace(temp_file.name, '/etc/resolv.conf')
+            logger.info(f"Successfully set DNS servers to {dns_servers} in /etc/resolv.conf")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error setting DNS servers: {e}")
+        if 'temp_file' in locals() and os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
+        return False
+
+def get_active_interface() -> Optional[str]:
+    """
+    Get the name of the active network interface on Linux.
+    
+    Returns:
+        Name of the active interface or None if not found
+    """
+    try:
+        # Try to get the default interface from the routing table
+        result = subprocess.run(
+            ['ip', 'route', 'show', 'default'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Parse output for default interface
+            # Expected format: default via 192.168.1.1 dev eth0 ...
+            match = re.search(r'default via \S+ dev (\S+)', result.stdout)
+            if match:
+                return match.group(1)
+        
+        # Alternative method if ip route didn't work
+        result = subprocess.run(
+            ['route', '-n'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Find default gateway
+            for line in result.stdout.splitlines():
+                if line.startswith('0.0.0.0'):
+                    parts = line.split()
+                    if len(parts) >= 8:
+                        return parts[7]
+        
+        # Last resort: find any interface with an IP address
+        result = subprocess.run(
+            ['ip', 'addr', 'show'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            interfaces = re.findall(r'\d+: (\S+):', result.stdout)
+            for interface in interfaces:
+                # Skip loopback
+                if interface == 'lo':
+                    continue
+                    
+                # Check if this interface has an IPv4 address
+                ip_result = subprocess.run(
+                    ['ip', 'addr', 'show', 'dev', interface],
+                    capture_output=True, text=True
+                )
+                
+                if ip_result.returncode == 0 and re.search(r'inet \d+\.\d+\.\d+\.\d+', ip_result.stdout):
+                    return interface
+        
+        logger.warning("No active network interface found")
+        return None
+    except Exception as e:
+        logger.error(f"Error getting active interface: {e}")
+        return None
+
+def get_linux_wifi_signal() -> int:
+    """
+    Get WiFi signal strength on Linux.
+    
+    Returns:
+        Signal strength as a percentage (0-100)
+    """
+    try:
+        # First try iwconfig to get signal quality
+        interface = _get_wifi_interface()
+        if not interface:
+            logger.warning("No WiFi interface found")
+            return 0
+            
+        # Use iwconfig to get signal information
+        result = subprocess.run(
+            ['iwconfig', interface],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Look for signal level in dBm
+            match_dbm = re.search(r'Signal level=(-\d+) dBm', result.stdout)
+            if match_dbm:
+                # Convert dBm to percentage (approximate)
+                # -50 dBm is excellent (100%), -100 dBm is very poor (0%)
+                dbm = int(match_dbm.group(1))
+                percentage = max(0, min(100, 2 * (dbm + 100)))
+                return percentage
+                
+            # Try to find quality value (Some drivers report Quality=X/Y)
+            match_quality = re.search(r'Quality=(\d+)/(\d+)', result.stdout)
+            if match_quality:
+                quality = int(match_quality.group(1))
+                max_quality = int(match_quality.group(2))
+                return int(quality * 100 / max_quality)
+        
+        # If iwconfig failed, try using iw
+        result = subprocess.run(
+            ['iw', 'dev', interface, 'link'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Look for signal strength in dBm
+            match = re.search(r'signal: (-\d+) dBm', result.stdout)
+            if match:
+                # Convert dBm to percentage
+                dbm = int(match.group(1))
+                percentage = max(0, min(100, 2 * (dbm + 100)))
+                return percentage
+        
+        logger.warning("Could not determine WiFi signal strength")
+        return 0
+    except Exception as e:
+        logger.error(f"Error getting WiFi signal strength: {e}")
+        return 0
+
+def _get_wifi_interface() -> Optional[str]:
+    """
+    Helper function to find the active WiFi interface.
+    
+    Returns:
+        WiFi interface name or None if not found
+    """
+    try:
+        # Look for wireless interfaces using iw
+        result = subprocess.run(
+            ['iw', 'dev'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Extract interface names
+            interfaces = re.findall(r'Interface (\S+)', result.stdout)
+            if interfaces:
+                return interfaces[0]  # Return the first wireless interface
+        
+        # Fallback to iwconfig
+        result = subprocess.run(
+            ['iwconfig'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Look for any interface that doesn't show "no wireless extensions"
+            lines = result.stdout.split('\n')
+            for line in lines:
+                if line and "no wireless extensions" not in line:
+                    return line.split()[0]
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error finding WiFi interface: {e}")
+        return None
+
+def find_linux_best_channel() -> int:
+    """
+    Find the best WiFi channel on Linux by analyzing nearby networks.
+    
+    Returns:
+        Recommended channel number
+    """
+    try:
+        interface = _get_wifi_interface()
+        if not interface:
+            logger.warning("No WiFi interface found")
+            return 6  # Default to channel 6
+        
+        # Check if we can use iw
+        result = subprocess.run(
+            ['iw', 'dev', interface, 'scan'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Parse scan results
+            channel_count = {}
+            
+            # Extract channels from scan results
+            # Format: * freq: 2412 (Channel 1)
+            channels = re.findall(r'freq: \d+ \(Channel (\d+)\)', result.stdout)
+            
+            # Count occurrence of each channel
+            for channel in channels:
+                channel_int = int(channel)
+                if channel_int in channel_count:
+                    channel_count[channel_int] += 1
+                else:
+                    channel_count[channel_int] = 1
+            
+            if not channel_count:
+                logger.warning("No WiFi channels detected")
+                return 6  # Default to channel 6
+            
+            # Find the least congested channel among the primary channels (1, 6, 11)
+            primary_channels = {1: 0, 6: 0, 11: 0}
+            
+            for channel in primary_channels:
+                # Count channels that would overlap
+                for ch, count in channel_count.items():
+                    if abs(channel - ch) <= 2:  # Channels within 2 positions will overlap
+                        primary_channels[channel] += count
+            
+            # Find channel with minimum interference
+            best_channel = min(primary_channels.items(), key=lambda x: x[1])[0]
+            logger.info(f"Best WiFi channel determined to be {best_channel}")
+            return best_channel
+        else:
+            # Fallback to iwlist
+            result = subprocess.run(
+                ['iwlist', interface, 'scanning'],
+                capture_output=True, text=True
+            )
+            
+            if result.returncode == 0:
+                # Parse scan results
+                channels = re.findall(r'Channel:(\d+)', result.stdout)
+                channel_count = {}
+                
+                # Count occurrence of each channel
+                for channel in channels:
+                    channel_int = int(channel)
+                    if channel_int in channel_count:
+                        channel_count[channel_int] += 1
+                    else:
+                        channel_count[channel_int] = 1
+                
+                if not channel_count:
+                    return 6  # Default to channel 6
+                
+                # Find the least congested channel among the primary channels (1, 6, 11)
+                primary_channels = {1: 0, 6: 0, 11: 0}
+                
+                for channel in primary_channels:
+                    # Count channels that would overlap
+                    for ch, count in channel_count.items():
+                        if abs(channel - ch) <= 2:  # Channels within 2 positions will overlap
+                            primary_channels[channel] += count
+                
+                # Find channel with minimum interference
+                best_channel = min(primary_channels.items(), key=lambda x: x[1])[0]
+                return best_channel
+        
+        # If all methods failed, return a default
+        return 6
+    except Exception as e:
+        logger.error(f"Error finding best WiFi channel: {e}")
+        return 6  # Default to channel 6
+
+def optimize_tcp_settings(params: Dict[str, Any]) -> bool:
+    """
+    Optimize TCP settings on Linux by modifying sysctl parameters.
+    
+    Args:
+        params: Dictionary of TCP parameters to set
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not is_root():
+        logger.error("Root privileges required to optimize TCP settings")
+        return False
+    
+    try:
+        success = True
+        
+        # Create a backup of current sysctl settings
+        backup_file = '/tmp/sysctl_backup.conf'
+        subprocess.run(['sysctl', '-a'], stdout=open(backup_file, 'w'), stderr=subprocess.PIPE)
+        
+        # Apply each parameter
+        for param_name, param_value in params.items():
+            # Convert parameter name to Linux sysctl format if needed
+            sysctl_name = param_name
+            if not sysctl_name.startswith('net.'):
+                sysctl_name = f"net.ipv4.{param_name}"
+            
+            # Set the parameter
+            result = subprocess.run(
+                ['sysctl', '-w', f"{sysctl_name}={param_value}"],
+                capture_output=True, text=True
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"Failed to set {sysctl_name}={param_value}: {result.stderr}")
+                success = False
+            else:
+                logger.info(f"Set TCP parameter {sysctl_name} to {param_value}")
+        
+        # Make the changes persistent by adding them to sysctl.conf
+        if success:
+            # Create a Signal Booster specific configuration file
+            with open('/etc/sysctl.d/99-signal-booster.conf', 'w') as f:
+                f.write("# TCP optimizations set by Signal Booster\n")
+                for param_name, param_value in params.items():
+                    sysctl_name = param_name
+                    if not sysctl_name.startswith('net.'):
+                        sysctl_name = f"net.ipv4.{param_name}"
+                    f.write(f"{sysctl_name} = {param_value}\n")
+            
+            logger.info("TCP settings optimized and made persistent")
+        
+        return success
+    except Exception as e:
+        logger.error(f"Error optimizing TCP settings: {e}")
+        return False
+
+def measure_linux_jitter(host: str = "8.8.8.8", count: int = 10) -> float:
+    """
+    Measure network jitter (latency variation) on Linux.
+    
+    Args:
+        host: Target host to ping (default: 8.8.8.8)
+        count: Number of pings to perform
+        
+    Returns:
+        Jitter value in milliseconds
+    """
+    try:
+        # Use ping to get jitter information
+        result = subprocess.run(
+            ['ping', '-c', str(count), host],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Parse the output to extract min/avg/max/mdev values
+            # Format: min/avg/max/mdev = 14.343/15.841/17.164/0.903 ms
+            match = re.search(r'min/avg/max/mdev = (\d+\.\d+)/(\d+\.\d+)/(\d+\.\d+)/(\d+\.\d+)', result.stdout)
+            if match:
+                # mdev (mean deviation) is a good measurement of jitter
+                jitter = float(match.group(4))
+                return jitter
+                
+            # Alternative approach: calculate jitter based on min and max
+            match = re.search(r'min/avg/max.* = (\d+\.\d+)/(\d+\.\d+)/(\d+\.\d+)', result.stdout)
+            if match:
+                min_latency = float(match.group(1))
+                max_latency = float(match.group(3))
+                # Approximate jitter as half the difference between max and min
+                jitter = (max_latency - min_latency) / 2
+                return jitter
+        
+        logger.warning(f"Failed to measure jitter: ping command returned {result.returncode}")
+        return 0.0
+    except Exception as e:
+        logger.error(f"Error measuring jitter: {e}")
+        return 0.0
+
+def measure_linux_packet_loss(host: str = "8.8.8.8", count: int = 10) -> float:
+    """
+    Measure packet loss percentage on Linux.
+    
+    Args:
+        host: Target host to ping (default: 8.8.8.8)
+        count: Number of pings to perform
+        
+    Returns:
+        Packet loss percentage (0-100)
+    """
+    try:
+        # Use ping to get packet loss information
+        result = subprocess.run(
+            ['ping', '-c', str(count), host],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            # Parse the output to extract packet loss percentage
+            # Format: "10 packets transmitted, 9 received, 10% packet loss"
+            match = re.search(r'(\d+)% packet loss', result.stdout)
+            if match:
+                packet_loss = float(match.group(1))
+                return packet_loss
+        elif result.returncode == 1:
+            # Some packets were received, but not all
+            match = re.search(r'(\d+)% packet loss', result.stdout)
+            if match:
+                packet_loss = float(match.group(1))
+                return packet_loss
+            
+        # If ping fails completely or we can't parse the output
+        if result.returncode == 2:
+            # No packets received or host unreachable
+            logger.warning(f"Host {host} is unreachable")
+            return 100.0
+        
+        logger.warning(f"Failed to measure packet loss: unexpected output format")
+        return 0.0
+    except Exception as e:
+        logger.error(f"Error measuring packet loss: {e}")
+        return 0.0
+
+def measure_linux_bandwidth(duration: int = 5) -> Dict[str, float]:
+    """
+    Measure network bandwidth on Linux.
+    
+    Args:
+        duration: Duration in seconds for the bandwidth test
+        
+    Returns:
+        Dictionary with download and upload speeds in Mbps
+    """
+    result = {"download": 0.0, "upload": 0.0}
+    
+    try:
+        # Check if speedtest-cli is available
+        speedtest_available = subprocess.run(
+            ['which', 'speedtest-cli'],
+            capture_output=True
+        ).returncode == 0
+        
+        if speedtest_available:
+            logger.info("Using speedtest-cli to measure bandwidth")
+            cmd = ['speedtest-cli', '--simple']
+            
+            # Set timeout to duration + 10 seconds to ensure it completes
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=duration + 10
+            )
+            
+            if proc.returncode == 0:
+                # Parse download speed
+                download_match = re.search(r'Download: (\d+\.\d+) Mbit/s', proc.stdout)
+                if download_match:
+                    result["download"] = float(download_match.group(1))
+                
+                # Parse upload speed
+                upload_match = re.search(r'Upload: (\d+\.\d+) Mbit/s', proc.stdout)
+                if upload_match:
+                    result["upload"] = float(upload_match.group(1))
+                
+                return result
+        
+        # Fallback: Use iperf3 if available
+        iperf_available = subprocess.run(
+            ['which', 'iperf3'],
+            capture_output=True
+        ).returncode == 0
+        
+        if iperf_available:
+            logger.info("Using iperf3 to measure bandwidth")
+            
+            # Use public iperf3 servers - first check if we can reach one
+            servers = [
+                "iperf.he.net",
+                "iperf.scottlinux.com",
+                "bouygues.iperf.fr",
+                "ping.online.net"
+            ]
+            
+            for server in servers:
+                # Try to ping the server first to check if it's reachable
+                ping_result = subprocess.run(
+                    ['ping', '-c', '1', '-W', '2', server],
+                    capture_output=True
+                )
+                
+                if ping_result.returncode == 0:
+                    # Server is reachable, try to measure download speed
+                    try:
+                        down_proc = subprocess.run(
+                            ['iperf3', '-c', server, '-t', str(duration), '-J'],
+                            capture_output=True,
+                            text=True,
+                            timeout=duration + 5
+                        )
+                        
+                        if down_proc.returncode == 0:
+                            # Parse JSON output
+                            import json
+                            data = json.loads(down_proc.stdout)
+                            if 'end' in data and 'sum_received' in data['end']:
+                                # Convert bits per second to Mbps
+                                result["download"] = data['end']['sum_received']['bits_per_second'] / 1_000_000
+                            
+                            # Try to measure upload speed
+                            up_proc = subprocess.run(
+                                ['iperf3', '-c', server, '-t', str(duration), '-R', '-J'],
+                                capture_output=True,
+                                text=True,
+                                timeout=duration + 5
+                            )
+                            
+                            if up_proc.returncode == 0:
+                                data = json.loads(up_proc.stdout)
+                                if 'end' in data and 'sum_received' in data['end']:
+                                    result["upload"] = data['end']['sum_received']['bits_per_second'] / 1_000_000
+                            
+                            return result
+                    except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+                        logger.warning(f"iperf3 test failed with {server}: {str(e)}")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"iperf3 test failed with {server}: {str(e)}")
+                        continue
+        
+        # Final fallback: Measure using interface statistics
+        interface = get_active_interface()
+        if interface:
+            logger.info(f"Measuring bandwidth using interface statistics for {interface}")
+            
+            # Get initial byte counts
+            with open(f"/proc/net/dev", "r") as f:
+                lines = f.readlines()
+            
+            initial_rx_bytes = 0
+            initial_tx_bytes = 0
+            
+            for line in lines:
+                if interface in line:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        stats = parts[1].strip().split()
+                        if len(stats) >= 9:
+                            initial_rx_bytes = int(stats[0])  # Received bytes
+                            initial_tx_bytes = int(stats[8])  # Transmitted bytes
+            
+            # Wait for the specified duration
+            time.sleep(duration)
+            
+            # Get final byte counts
+            with open(f"/proc/net/dev", "r") as f:
+                lines = f.readlines()
+            
+            final_rx_bytes = 0
+            final_tx_bytes = 0
+            
+            for line in lines:
+                if interface in line:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        stats = parts[1].strip().split()
+                        if len(stats) >= 9:
+                            final_rx_bytes = int(stats[0])  # Received bytes
+                            final_tx_bytes = int(stats[8])  # Transmitted bytes
+            
+            # Calculate bits per second (convert to Mbps)
+            rx_bps = (final_rx_bytes - initial_rx_bytes) * 8 / duration / 1_000_000
+            tx_bps = (final_tx_bytes - initial_tx_bytes) * 8 / duration / 1_000_000
+            
+            result["download"] = rx_bps
+            result["upload"] = tx_bps
+            
+            return result
+        
+        logger.warning("Could not measure bandwidth: no suitable tools available")
+        return result
+    except Exception as e:
+        logger.error(f"Error measuring bandwidth: {e}")
+        return result
+
+def analyze_linux_network_congestion(interface: Optional[str] = None) -> float:
+    """
+    Analyze network congestion on Linux.
+    
+    Args:
+        interface: Network interface to analyze (if None, uses active interface)
+        
+    Returns:
+        Congestion percentage (0-100)
+    """
+    try:
+        congestion_factors = []
+        
+        # Get the active interface if not specified
+        if not interface:
+            interface = get_active_interface()
+        
+        if not interface:
+            logger.warning("No active interface found for congestion analysis")
+            return 30.0  # Default to moderate congestion
+        
+        # Factor 1: Measure jitter
+        jitter = measure_linux_jitter()
+        # Normalize jitter to a 0-100 scale (higher means more congestion)
+        # 0ms jitter = 0% congestion, 30ms jitter = 100% congestion
+        jitter_factor = min(100, jitter * 3.33)
+        congestion_factors.append(jitter_factor)
+        
+        # Factor 2: Measure packet loss
+        packet_loss = measure_linux_packet_loss()
+        # Packet loss directly contributes to congestion assessment
+        congestion_factors.append(packet_loss)
+        
+        # Factor 3: Check network interface statistics for errors and drops
+        try:
+            with open("/proc/net/dev", "r") as f:
+                lines = f.readlines()
+            
+            for line in lines:
+                if interface in line:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        # Extract statistics
+                        stats = parts[1].strip().split()
+                        if len(stats) >= 4:
+                            # Format: bytes packets errs drop fifo frame compressed multicast
+                            packets = int(stats[1])
+                            errors = int(stats[2])
+                            drops = int(stats[3])
+                            
+                            if packets > 0:
+                                # Calculate error and drop percentages
+                                error_percent = min(100, (errors / max(1, packets)) * 100)
+                                drop_percent = min(100, (drops / max(1, packets)) * 100)
+                                
+                                congestion_factors.append(error_percent)
+                                congestion_factors.append(drop_percent)
+        except Exception as e:
+            logger.error(f"Error analyzing interface statistics: {e}")
+        
+        # Factor 4: Check current system load as a proxy for local congestion
+        try:
+            # Get system load average
+            load_avg = os.getloadavg()[0]  # 1-minute load average
+            # Normalize: load of 1.0 per CPU is normal, higher is congested
+            import multiprocessing
+            cpu_count = multiprocessing.cpu_count()
+            normalized_load = load_avg / cpu_count
+            
+            # Convert to congestion percentage (load of 0 is 0%, load ≥ 2x CPUs is 100%)
+            load_congestion = min(100, max(0, (normalized_load - 0.7) * 100))
+            
+            # Add with lower weight as it's an indirect factor
+            congestion_factors.append(load_congestion * 0.5)
+        except Exception as e:
+            logger.error(f"Error checking system load: {e}")
+        
+        # Calculate overall congestion percentage
+        if congestion_factors:
+            return sum(congestion_factors) / len(congestion_factors)
+        
+        return 30.0  # Default to moderate congestion
+    except Exception as e:
+        logger.error(f"Error analyzing network congestion: {e}")
+        return 30.0  # Default to moderate congestion
+
+def clear_linux_network_buffers() -> bool:
+    """
+    Clear network buffers on Linux to reset connection state.
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if not is_root():
+        logger.error("Root privileges required to clear network buffers")
+        return False
+    
+    try:
+        # Flush routing table
+        flush_route = subprocess.run(
+            ['ip', 'route', 'flush', 'cache'],
+            capture_output=True, text=True
+        )
+        
+        # Clear netfilter connection tracking table
+        clear_conntrack = subprocess.run(
+            ['conntrack', '-F'],
+            capture_output=True, text=True
+        )
+        
+        # If conntrack command is not available, try the proc interface
+        if clear_conntrack.returncode != 0:
+            if os.path.exists('/proc/net/nf_conntrack'):
+                with open('/proc/sys/net/netfilter/nf_conntrack_max', 'r') as f:
+                    max_conn = int(f.read().strip())
+                
+                # Writing to the count file resets it
+                with open('/proc/sys/net/netfilter/nf_conntrack_count', 'w') as f:
+                    f.write('0')
+        
+        logger.info("Successfully cleared network buffers")
+        return True
+    except Exception as e:
+        logger.error(f"Error clearing network buffers: {e}")
+        return False
+
+def set_linux_qos_priority(interface: str, port: int, protocol: str = 'both', priority: str = 'high') -> bool:
+    """
+    Set QoS priority for specific traffic on Linux using tc (traffic control).
+    
+    Args:
+        interface: Network interface to apply QoS rules to
+        port: Port number to prioritize
+        protocol: Protocol ('tcp', 'udp', or 'both')
+        priority: Priority level ('high', 'medium', 'low')
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not is_root():
+        logger.error("Root privileges required to set QoS priorities")
+        return False
+    
+    try:
+        # Convert priority to tc class values
+        prio_map = {
+            'high': 1,
+            'medium': 2,
+            'low': 3
+        }
+        
+        if priority not in prio_map:
+            logger.error(f"Invalid priority: {priority}")
+            return False
+        
+        prio_value = prio_map[priority]
+        
+        # Set up the traffic control qdisc (if not exists)
+        subprocess.run(
+            ['tc', 'qdisc', 'del', 'dev', interface, 'root'],
+            capture_output=True
+        )  # Ignore errors as it might not exist
+        
+        result = subprocess.run(
+            ['tc', 'qdisc', 'add', 'dev', interface, 'root', 'handle', '1:', 'prio'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode != 0:
+            logger.error(f"Failed to add qdisc: {result.stderr}")
+            return False
+        
+        # Add filter rules for the specified port and protocol
+        if protocol in ['tcp', 'both']:
+            tcp_result = subprocess.run(
+                [
+                    'tc', 'filter', 'add', 'dev', interface, 'protocol', 'ip', 
+                    'parent', '1:', 'prio', '1', 'u32', 'match', 'ip', 'sport', 
+                    str(port), '0xffff', 'match', 'ip', 'protocol', '6', '0xff',
+                    'flowid', f'1:{prio_value}'
+                ],
+                capture_output=True, text=True
+            )
+            
+            if tcp_result.returncode != 0:
+                logger.error(f"Failed to add TCP filter: {tcp_result.stderr}")
+                return False
+        
+        if protocol in ['udp', 'both']:
+            udp_result = subprocess.run(
+                [
+                    'tc', 'filter', 'add', 'dev', interface, 'protocol', 'ip', 
+                    'parent', '1:', 'prio', '1', 'u32', 'match', 'ip', 'sport', 
+                    str(port), '0xffff', 'match', 'ip', 'protocol', '17', '0xff',
+                    'flowid', f'1:{prio_value}'
+                ],
+                capture_output=True, text=True
+            )
+            
+            if udp_result.returncode != 0:
+                logger.error(f"Failed to add UDP filter: {udp_result.stderr}")
+                return False
+        
+        logger.info(f"Successfully set QoS priority for port {port} to {priority}")
+        return True
+    except Exception as e:
+        logger.error(f"Error setting QoS priority: {e}")
+        return False
+
+def get_linux_network_interfaces() -> List[Dict[str, Any]]:
+    """
+    Get detailed information about network interfaces on Linux.
+    
+    Returns:
+        List of dictionaries containing interface details
+    """
+    interfaces = []
+    
+    try:
+        # Get list of interfaces and their status
+        result = subprocess.run(
+            ['ip', '-json', 'addr', 'show'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            try:
+                # Parse JSON output
+                import json
+                ifaces_data = json.loads(result.stdout)
+                
+                for iface in ifaces_data:
+                    interface_info = {
+                        'name': iface.get('ifname', ''),
+                        'mac': iface.get('address', ''),
+                        'mtu': iface.get('mtu', 0),
+                        'state': iface.get('operstate', ''),
+                        'ipv4': [],
+                        'ipv6': []
+                    }
+                    
+                    # Extract IP addresses
+                    if 'addr_info' in iface:
+                        for addr in iface['addr_info']:
+                            if addr.get('family') == 'inet':
+                                interface_info['ipv4'].append({
+                                    'address': addr.get('local', ''),
+                                    'prefix': addr.get('prefixlen', 0)
+                                })
+                            elif addr.get('family') == 'inet6':
+                                interface_info['ipv6'].append({
+                                    'address': addr.get('local', ''),
+                                    'prefix': addr.get('prefixlen', 0)
+                                })
+                    
+                    interfaces.append(interface_info)
+                
+                return interfaces
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse JSON output from ip command")
+        
+        # Fallback to traditional parsing
+        result = subprocess.run(
+            ['ip', 'addr', 'show'],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            current_iface = None
+            
+            for line in result.stdout.splitlines():
+                # New interface
+                if line[0] != ' ':
+                    iface_match = re.search(r'^\d+:\s+(\S+):\s+<(.+)>', line)
+                    if iface_match:
+                        if current_iface:
+                            interfaces.append(current_iface)
+                        
+                        name = iface_match.group(1)
+                        flags = iface_match.group(2).split(',')
+                        
+                        current_iface = {
+                            'name': name,
+                            'mac': '',
+                            'mtu': 0,
+                            'state': 'DOWN' if 'DOWN' in flags else 'UP' if 'UP' in flags else 'UNKNOWN',
+                            'ipv4': [],
+                            'ipv6': []
+                        }
+                        
+                        # Extract MTU
+                        mtu_match = re.search(r'mtu\s+(\d+)', line)
+                        if mtu_match:
+                            current_iface['mtu'] = int(mtu_match.group(1))
+                
+                # MAC address
+                elif 'link/ether' in line and current_iface:
+                    mac_match = re.search(r'link/ether\s+(\S+)', line)
+                    if mac_match:
+                        current_iface['mac'] = mac_match.group(1)
+                
+                # IPv4 address
+                elif 'inet ' in line and current_iface:
+                    ipv4_match = re.search(r'inet\s+(\S+)/(\d+)', line)
+                    if ipv4_match:
+                        current_iface['ipv4'].append({
+                            'address': ipv4_match.group(1),
+                            'prefix': int(ipv4_match.group(2))
+                        })
+                
+                # IPv6 address
+                elif 'inet6' in line and current_iface:
+                    ipv6_match = re.search(r'inet6\s+(\S+)/(\d+)', line)
+                    if ipv6_match:
+                        current_iface['ipv6'].append({
+                            'address': ipv6_match.group(1),
+                            'prefix': int(ipv6_match.group(2))
+                        })
+            
+            # Add the last interface
+            if current_iface:
+                interfaces.append(current_iface)
+            
+            return interfaces
+    except Exception as e:
+        logger.error(f"Error getting network interfaces: {e}")
+    
+    return interfaces 
